@@ -31,6 +31,16 @@ class PPOTrainerSync(PPOTrainer):
     def on_init_end(self):
         # update weights after loading checkpoint
         self.checkpoint_manager.update_weights(self.global_steps)
+        # ``PPOTrainer.init`` puts colocated rollout replicas to sleep before
+        # loading the actor checkpoint.  The naive checkpoint backend only
+        # synchronizes weights and does not wake the inference engine, so the
+        # initial validation/rollout would otherwise wait forever in the queue.
+        self.checkpoint_manager.wake_up_replicas()
+
+    def on_step_begin(self):
+        # Replicas are slept after every sample to release GPU memory while
+        # actor training runs.  Wake them before submitting the next rollout.
+        self.checkpoint_manager.wake_up_replicas()
 
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):

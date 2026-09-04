@@ -249,9 +249,8 @@ class AgentLoopManagerTQ(AgentLoopManager):
             prompts (TensorDict): Input batch from train or validation dataset.
         """
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
-            ]
-        )
+        # Worker methods only enqueue background agent-loop tasks and return.
+        # Waiting with ray.get here can block the controller/event-loop path;
+        # dispatch the calls and let TransferQueue carry the results back.
+        for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False):
+            worker.generate_sequences.remote(chunk)
