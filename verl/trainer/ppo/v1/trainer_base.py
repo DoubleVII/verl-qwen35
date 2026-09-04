@@ -557,7 +557,11 @@ class PPOTrainer(ABC):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
 
         # 3. balance batch across data parallel groups
-        batch = self._balance_batch(batch, metrics=metrics)
+        batch = self._balance_batch(
+            batch,
+            metrics=metrics,
+            keep_group=self.config.reward.reward_model.get("keep_group", False),
+        )
 
         # 4. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1438,7 +1442,7 @@ class PPOTrainer(ABC):
         assert self.reward_loop_manager is not None, "RewardLoopManager is None"
 
         # 1. read the fields required by the reward model from TransferQueue.
-        fields = ["prompts", "responses", "raw_prompt", "data_source", "reward_model", "extra_info"]
+        fields = ["prompts", "responses", "raw_prompt", "data_source", "reward_model", "extra_info", "uid"]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         prompt_lengths = data["prompts"].offsets().diff()
@@ -1466,6 +1470,7 @@ class PPOTrainer(ABC):
             "data_source": as_object_array(data["data_source"]),
             "reward_model": as_object_array(data["reward_model"]),
             "extra_info": as_object_array(data["extra_info"]),
+            "uid": as_object_array(data["uid"]),
         }
 
         rm_input = DataProto(
@@ -1521,7 +1526,9 @@ class PPOTrainer(ABC):
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
 
-    def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+    def _balance_batch(
+        self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False, keep_group=False
+    ):
         """Reorder the data on single controller such that each dp rank gets similar total tokens."""
         # get actor dp size
         role, worker_group = "actor", self.actor_rollout_wg
@@ -1538,8 +1545,18 @@ class PPOTrainer(ABC):
         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
 
-        # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
+        # Keep all trajectories sharing a uid on one reward-model replica.
+        if keep_group:
+            from verl.utils.seqlen_balancing import get_group_balanced_partitions
+
+            if len(batch.keys) % dp_size:
+                raise ValueError(f"keep_group requires batch size divisible by dp size: {len(batch.keys)} vs {dp_size}")
+            global_partition_lst = get_group_balanced_partitions(
+                seqlen_list=global_seqlen_lst.tolist(), uid_list=list(batch.keys), k_partitions=dp_size
+            )
+        else:
+            # reorder based on index. The data will be automatically equally partitioned by dispatch function
+            global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
         batch.reorder([j for partition in global_partition_lst for j in partition])
         global_balance_stats = log_seqlen_unbalance(
             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix

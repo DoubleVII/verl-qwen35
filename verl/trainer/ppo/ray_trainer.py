@@ -1179,7 +1179,7 @@ class RayPPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False, keep_group=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
         When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
@@ -1194,7 +1194,7 @@ class RayPPOTrainer:
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
 
         # Use group-level balancing for PrefixGrouper to keep same-uid samples together
-        if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
+        if (getattr(self, "use_prefix_grouper", False) or keep_group) and "uid" in batch.non_tensor_batch:
             from verl.utils.seqlen_balancing import get_group_balanced_partitions
 
             uid_list = list(batch.non_tensor_batch["uid"])
@@ -1235,7 +1235,7 @@ class RayPPOTrainer:
             global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
         # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
         # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
-        if not getattr(self, "use_prefix_grouper", False):
+        if not (getattr(self, "use_prefix_grouper", False) or keep_group):
             for idx, partition in enumerate(global_partition_lst):
                 partition.sort(key=lambda x: (workload_lst[x], x))
                 ordered_partition = partition[::2] + partition[1::2][::-1]
@@ -1547,7 +1547,11 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        self._balance_batch(
+                            batch,
+                            metrics=metrics,
+                            keep_group=self.config.reward.reward_model.get("keep_group", False),
+                        )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()

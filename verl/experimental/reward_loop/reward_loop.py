@@ -64,6 +64,8 @@ def migrate_legacy_reward_impl(config):
     for key in ["enable", "enable_resource_pool", "n_gpus_per_node", "nnodes"]:
         if config.reward_model.get(key) is not None:
             config.reward.reward_model[key] = config.reward_model[key]
+    if config.reward_model.get("keep_group") is not None:
+        config.reward.reward_model.keep_group = config.reward_model.keep_group
     if config.reward_model.model.path is not None:
         config.reward.reward_model.model_path = config.reward_model.model.path
     # config.reward_model.reward_kwargs -> config.reward.reward_kwargs (for dapo algo)
@@ -136,6 +138,8 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        if hasattr(self.reward_manager, "run_batch"):
+            return await self.reward_manager.run_batch(data)
         tasks = []
         for i in range(len(data)):
             tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
@@ -347,6 +351,18 @@ class RewardLoopManager:
         num_workers = len(self.reward_loop_workers)
         padded_data, pad_size = pad_dataproto_to_divisor(data, num_workers)
         chunks = padded_data.chunk(num_workers)
+        # Group managers require complete uid groups in one worker.  Normal
+        # balancing aligns these boundaries; fall back to a single worker for
+        # manually assembled or uneven batches rather than silently scoring
+        # split groups as independent candidates.
+        if hasattr(self.reward_manager, "run_batch") and "uid" in padded_data.non_tensor_batch:
+            uids = list(padded_data.non_tensor_batch["uid"])
+            size = len(uids) // num_workers
+            locations = {}
+            for index, uid in enumerate(uids):
+                locations.setdefault(str(uid), set()).add(index // size)
+            if any(len(worker_ids) > 1 for worker_ids in locations.values()):
+                chunks = [padded_data] + [padded_data.slice(0, 0) for _ in range(num_workers - 1)]
         outputs = ray.get(
             [
                 worker.compute_score_batch.remote(chunk)

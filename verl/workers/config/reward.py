@@ -15,7 +15,7 @@
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 from verl.trainer.config.config import ModuleConfig
@@ -86,6 +86,7 @@ class RewardModelConfig(BaseConfig):
     enable_resource_pool: bool = False
     n_gpus_per_node: int = 8
     nnodes: int = 0
+    keep_group: bool = False
     model_path: Optional[str] = None
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
 
@@ -96,6 +97,8 @@ class RewardConfig(BaseConfig):
 
     # reward manager args
     num_workers: int = 8
+    reward_kwargs: dict[str, Any] = field(default_factory=dict)
+    custom_processor: dict[str, Any] = field(default_factory=dict)
     reward_manager: RewardManagerConfig = field(default_factory=RewardManagerConfig)
 
     # reward model args

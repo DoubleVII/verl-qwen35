@@ -18,6 +18,7 @@ from .gdpo import GDPORewardManager
 from .naive import NaiveRewardManager
 from .limited import RateLimitedRewardManager
 from .remote import RemoteRewardManager
+from .group import GroupRewardManager
 
 __all__ = [
     "DAPORewardManager",
@@ -25,6 +26,7 @@ __all__ = [
     "NaiveRewardManager",
     "RateLimitedRewardManager",
     "RemoteRewardManager",
+    "GroupRewardManager",
     "register",
     "get_reward_manager_cls",
 ]
