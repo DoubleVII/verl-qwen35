@@ -355,7 +355,10 @@ class RewardLoopManager:
         # balancing aligns these boundaries; fall back to a single worker for
         # manually assembled or uneven batches rather than silently scoring
         # split groups as independent candidates.
-        if hasattr(self.reward_manager, "run_batch") and "uid" in padded_data.non_tensor_batch:
+        # The manager instance lives inside each RewardLoopWorker.  The
+        # controller keeps only the resolved class, so inspect that class when
+        # deciding whether a batch must remain group-contiguous.
+        if hasattr(self.reward_manager_cls, "run_batch") and "uid" in padded_data.non_tensor_batch:
             uids = list(padded_data.non_tensor_batch["uid"])
             size = len(uids) // num_workers
             locations = {}
