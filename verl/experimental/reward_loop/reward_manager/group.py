@@ -6,7 +6,14 @@ import numpy as np
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
-from verl.utils.reward_score.group import build_prompt, extract_response, language_pair, overlong_penalty, parse_scores
+from verl.utils.reward_score.group import (
+    build_prompt,
+    extract_response,
+    is_language_match,
+    language_pair,
+    overlong_penalty,
+    parse_scores,
+)
 
 
 @register("group")
@@ -26,6 +33,7 @@ class GroupRewardManager(RewardManagerBase):
         self.scale = float(cfg.get("score_scale_factor", 0.1))
         self.default = float(cfg.get("default_reward", 0.0))
         self.add_example = bool(cfg.get("group_add_example", False))
+        self.enable_language_detection = bool(cfg.get("enable_language_detection", False))
         self.overlong = cfg.get("overlong_buffer", None)
         self.model = config.reward.reward_model.model_path
 
@@ -55,7 +63,9 @@ class GroupRewardManager(RewardManagerBase):
             seen = {}
             for i in indices:
                 text = responses[i]
-                if text is not None and text not in seen:
+                target_lang = language_pair(infos[i])[1] if text is not None else ""
+                language_ok = not self.enable_language_detection or is_language_match(text, target_lang)
+                if text is not None and language_ok and text not in seen:
                     seen[text] = len(valid); valid.append(text)
             if len(valid) <= 1:
                 continue

@@ -9,6 +9,27 @@ LANG_MAP = {"ar":"Arabic","de":"German","el":"Greek","en":"English","es":"Spanis
 IDENTIFIERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
+def is_language_match(text: str, target_lang: str) -> bool:
+    """Return whether text matches the configured target language when lingua is available."""
+    try:
+        from lingua import Language, LanguageDetectorBuilder
+    except ImportError as exc:
+        raise ImportError(
+            "enable_language_detection=True requires the lingua-language-detector package"
+        ) from exc
+    languages = {
+        "en": Language.ENGLISH, "zh": Language.CHINESE, "de": Language.GERMAN,
+        "ru": Language.RUSSIAN, "ko": Language.KOREAN, "fr": Language.FRENCH,
+        "es": Language.SPANISH, "pt": Language.PORTUGUESE, "it": Language.ITALIAN,
+        "nl": Language.DUTCH,
+    }
+    expected = languages.get(str(target_lang).lower())
+    if expected is None or not text.strip():
+        return True
+    detector = LanguageDetectorBuilder.from_languages(*languages.values()).build()
+    return detector.detect_language_of(text) == expected
+
+
 def extract_response(text: str, kind: str) -> str | None:
     text = (text or "").strip()
     if not text:
