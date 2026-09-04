@@ -427,6 +427,12 @@ class BaseModelMerger(ABC):
         del state_dict
         del model
 
+        # Qwen3.5's transformers 5.x save hook can serialize the vision tower
+        # under ``model.language_model.visual`` even though vLLM and the
+        # training checkpoint use ``model.visual``. Normalize the emitted HF
+        # weights so the merged checkpoint can be loaded by both runtimes.
+        self._normalize_qwen35_visual_keys()
+
         processor = hf_processor(self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code)
         tokenizer = hf_tokenizer(self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code)
         if processor is not None:
@@ -437,6 +443,28 @@ class BaseModelMerger(ABC):
             tokenizer.save_pretrained(self.config.target_dir)
 
         validate_hf_model_output(self.config.target_dir)
+
+    def _normalize_qwen35_visual_keys(self) -> None:
+        if getattr(self.model_config, "model_type", None) != "qwen3_5":
+            return
+
+        from safetensors.torch import load_file, save_file
+
+        target_dir = Path(self.config.target_dir)
+        weight_files = sorted(target_dir.glob("model*.safetensors"))
+        for weight_file in weight_files:
+            tensors = load_file(weight_file, device="cpu")
+            renamed = {}
+            changed = False
+            for key, tensor in tensors.items():
+                new_key = key.replace("model.language_model.visual.", "model.visual.", 1)
+                if new_key != key:
+                    changed = True
+                if new_key in renamed:
+                    raise ValueError(f"Duplicate key after Qwen3.5 visual normalization: {new_key}")
+                renamed[new_key] = tensor
+            if changed:
+                save_file(renamed, weight_file)
 
     def upload_to_huggingface(self):
         import requests
