@@ -28,6 +28,9 @@ reward_model:
   _target_: verl.workers.config.RewardModelConfig
   enable: False
 
+  # Keep samples with the same uid on one reward-model replica.
+  keep_group: False
+
   # Whether to deploy the model to a separate resource pool.
   # If true, n_gpus_per_node & nnodes will be used to determine the resource node.
   enable_resource_pool: False
