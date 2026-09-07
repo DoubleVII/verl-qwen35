@@ -351,6 +351,7 @@ class RewardLoopManager:
         num_workers = len(self.reward_loop_workers)
         padded_data, pad_size = pad_dataproto_to_divisor(data, num_workers)
         chunks = padded_data.chunk(num_workers)
+        chunk_indices = [list(range(i * len(chunks[i]), (i + 1) * len(chunks[i]))) for i in range(num_workers)]
         # Group managers require complete uid groups in one worker.  Normal
         # balancing aligns these boundaries; fall back to a single worker for
         # manually assembled or uneven batches rather than silently scoring
@@ -360,19 +361,40 @@ class RewardLoopManager:
         # deciding whether a batch must remain group-contiguous.
         if hasattr(self.reward_manager_cls, "run_batch") and "uid" in padded_data.non_tensor_batch:
             uids = list(padded_data.non_tensor_batch["uid"])
-            size = len(uids) // num_workers
-            locations = {}
+            groups = {}
             for index, uid in enumerate(uids):
-                locations.setdefault(str(uid), set()).add(index // size)
-            if any(len(worker_ids) > 1 for worker_ids in locations.values()):
-                chunks = [padded_data] + [padded_data.slice(0, 0) for _ in range(num_workers - 1)]
+                groups.setdefault(str(uid), []).append(index)
+
+            # Assign complete UID groups greedily by sample count.  Replay
+            # completion order is not guaranteed to keep a group contiguous,
+            # so fixed contiguous chunks can split candidates across workers.
+            # Splitting makes group scoring incorrect; sending the whole batch
+            # to one worker is correct but unnecessarily serial.  This keeps
+            # groups intact while balancing the number of samples per worker.
+            assignments = [[] for _ in range(num_workers)]
+            loads = [0] * num_workers
+            for indices in sorted(groups.values(), key=len, reverse=True):
+                worker_id = min(range(num_workers), key=loads.__getitem__)
+                assignments[worker_id].extend(indices)
+                loads[worker_id] += len(indices)
+            chunk_indices = assignments
+            chunks = [padded_data.select_idxs(indices) for indices in assignments]
         outputs = ray.get(
             [
                 worker.compute_score_batch.remote(chunk)
                 for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
             ]
         )
-        outputs_flat = [item for sublist in outputs for item in sublist]
+        outputs_flat = [None] * len(padded_data)
+        for indices, worker_outputs in zip(chunk_indices, outputs, strict=True):
+            if len(indices) != len(worker_outputs):
+                raise RuntimeError(
+                    f"Reward worker returned {len(worker_outputs)} outputs for {len(indices)} assigned samples"
+                )
+            for index, item in zip(indices, worker_outputs, strict=True):
+                outputs_flat[index] = item
+        if any(item is None for item in outputs_flat):
+            raise RuntimeError("Reward workers did not return an output for every sample")
         if pad_size > 0:
             outputs_flat = outputs_flat[: len(data)]
 

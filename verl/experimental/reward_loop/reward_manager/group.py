@@ -36,13 +36,22 @@ class GroupRewardManager(RewardManagerBase):
         self.enable_language_detection = bool(cfg.get("enable_language_detection", False))
         self.overlong = cfg.get("overlong_buffer", None)
         self.model = config.reward.reward_model.model_path
+        rollout_cfg = config.reward.reward_model.get("rollout", {})
+        self.max_tokens = int(rollout_cfg.get("response_length") or 2048)
 
     async def _request(self, prompt: str) -> str:
-        payload = {"model": self.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 8192}
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.max_tokens,
+        }
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
             async with session.post(f"http://{self.router}/v1/chat/completions", json=payload) as response:
                 response.raise_for_status()
-                return (await response.json())["choices"][0]["message"]["content"]
+                response_json = await response.json()
+                choice = response_json["choices"][0]
+                result = choice["message"]["content"]
+                return result
 
     async def run_batch(self, data: DataProto) -> list[dict]:
         n = len(data)

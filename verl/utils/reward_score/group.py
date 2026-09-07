@@ -84,24 +84,35 @@ def parse_scores(text: str, prompt_type: str, count: int) -> list[int] | None:
     if not lines:
         return None
     score_line = lines[-1]
-    try:
-        scores = {k.strip(): int(v.strip()) for k, v in (part.split(":", 1) for part in score_line.split(","))}
-    except (ValueError, TypeError):
-        scores = {}
     if prompt_type == "ranking":
         ranking = score_line.split(">")
         if sum(len(t.split("=")) for t in ranking) != count:
             return None
         mapped = {name.strip(): count - i for i, tier in enumerate(ranking) for name in tier.split("=")}
         return [mapped.get(IDENTIFIERS[i], -1) for i in range(count)] if set(mapped) == set(IDENTIFIERS[:count]) else None
-    if set(scores) != set(IDENTIFIERS[:count]) or len(scores) != count:
-        return None
-    if prompt_type == "ranking_score" and len(lines) >= 2:
-        ranking = lines[-2].split(">")
-        tiers = [{x.strip() for x in tier.split("=")} for tier in ranking]
-        score_tiers = [{k for k, v in scores.items() if v == value} for value in sorted(set(scores.values()), reverse=True)]
-        if tiers != score_tiers:
+
+    if prompt_type == "score":
+        try:
+            scores = [int(item.strip().split(":")[-1].strip()) for item in score_line.split(",")]
+        except (AttributeError, TypeError, ValueError):
             return None
+        return scores if len(scores) == count else None
+
+    if prompt_type != "ranking_score":
+        return None
+
+    # Keep this parser in lockstep with examples/rewards/ranking_score_reward.py:
+    # GQM uses the final non-empty line as the score line and does not require
+    # the preceding analysis/ranking text to have a particular shape.
+    try:
+        scores = {}
+        for item in score_line.strip().split(","):
+            candidate_identifier, score = item.strip().split(":")
+            scores[candidate_identifier.strip()] = int(score.strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if len(scores) != count or set(scores) != set(IDENTIFIERS[:count]):
+        return None
     return [scores[IDENTIFIERS[i]] for i in range(count)]
 
 
