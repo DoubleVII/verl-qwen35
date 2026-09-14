@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -47,8 +48,7 @@ def normalize_fused_candidate(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
-def parse_fused_flash_gpe_markdown_response(text: str | None) -> tuple[list[str], str] | None:
-    """Parse candidate generation and post-edit sections from the fused Markdown protocol."""
+def _parse_fused_flash_gpe_sections(text: str | None) -> tuple[str, str] | None:
     if not isinstance(text, str):
         return None
     tags = (_FUSED_THINKING_OPEN, _FUSED_THINKING_CLOSE, _FUSED_RESPONSE_OPEN, _FUSED_RESPONSE_CLOSE)
@@ -62,6 +62,53 @@ def parse_fused_flash_gpe_markdown_response(text: str | None) -> tuple[list[str]
     )
     if not all((candidate_thinking, candidate_response, post_edit_thinking, post_edit_response)):
         return None
+    return candidate_response, post_edit_response
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    text = text.strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1 :]
+        if text.endswith("```"):
+            text = text[:-3].strip()
+    start = text.find("{")
+    if start == -1:
+        return None
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text[start:])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def parse_fused_flash_gpe_response(text: str | None) -> tuple[list[str], str] | None:
+    """Parse JSON candidates and the final translation from the fused protocol."""
+    sections = _parse_fused_flash_gpe_sections(text)
+    if sections is None:
+        return None
+    candidate_response, post_edit_response = sections
+
+    payload = _extract_json_object(candidate_response)
+    raw_candidates = payload.get("translations") if payload is not None else None
+    if not isinstance(raw_candidates, list):
+        return None
+    if any(not isinstance(candidate, str) or not candidate.strip() for candidate in raw_candidates):
+        return None
+    candidates = [candidate.strip() for candidate in raw_candidates]
+    final_translation = extract_response(post_edit_response, "codeblock")
+    if final_translation is None:
+        return None
+    return candidates, final_translation
+
+
+def parse_fused_flash_gpe_markdown_response(text: str | None) -> tuple[list[str], str] | None:
+    """Parse Markdown candidates and the final translation from the fused protocol."""
+    sections = _parse_fused_flash_gpe_sections(text)
+    if sections is None:
+        return None
+    candidate_response, post_edit_response = sections
 
     matches = list(re.finditer(r"(?m)^# Candidate ([1-9][0-9]*)[ \t]*$", candidate_response))
     if not matches:
@@ -111,12 +158,19 @@ def is_valid_fused_candidate_count(extra_info: Any, candidate_count: int) -> boo
             return False
         return candidate_count == target_candidate_count
 
-    return (
-        extra_info.get("prompt_type") == "markdown"
-        and max_candidates is not None
-        and max_candidates >= 2
-        and candidate_count == max_candidates
-    )
+    if max_candidates is None:
+        return False
+
+    prompt_type = extra_info.get("prompt_type")
+    if prompt_type == "markdown":
+        return max_candidates >= 2 and candidate_count == max_candidates
+    if prompt_type == "fixed_4":
+        return max_candidates == 4 and candidate_count == 4
+    if prompt_type == "fixed_16":
+        return max_candidates == 16 and candidate_count == 16
+    if prompt_type == "adaptive":
+        return max_candidates >= 2 and 2 <= candidate_count <= max_candidates
+    return False
 
 
 def myers_insert_delete_distance(left: list[int], right: list[int]) -> int:

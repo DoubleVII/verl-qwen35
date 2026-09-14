@@ -15,6 +15,7 @@ from verl.utils.reward_score.group import (
     normalize_fused_candidate,
     overlong_penalty,
     parse_fused_flash_gpe_markdown_response,
+    parse_fused_flash_gpe_response,
     parse_scores,
     token_myers_diversity,
 )
@@ -114,9 +115,9 @@ class GroupRewardManager(RewardManagerBase):
         return (await self.run_batch(data))[-1]
 
 
-@register("fused_flash_gpe_markdown")
-class FusedFlashGPEMarkdownRewardModelProcessor(GroupRewardManager):
-    """Score final translations from fused candidate-generation/post-edit responses."""
+@register("fused_flash_gpe")
+class FusedFlashGPERewardModelProcessor(GroupRewardManager):
+    """Score final translations from fused JSON candidate-generation/post-edit responses."""
 
     _DIVERSITY_ALGORITHMS = {"none", "exact_match", "token_myers"}
 
@@ -156,10 +157,21 @@ class FusedFlashGPEMarkdownRewardModelProcessor(GroupRewardManager):
         return self._cap_diversity_penalty(penalty)
 
     def _prepare_response(self, response: str, info: dict) -> tuple[str | None, float]:
-        parsed = parse_fused_flash_gpe_markdown_response(response)
+        parsed = self._parse_response(response)
         if parsed is None:
             return None, 0.0
         candidates, final_translation = parsed
         if not is_valid_fused_candidate_count(info, len(candidates)):
             return None, 0.0
         return final_translation, self._diversity_penalty(candidates)
+
+    def _parse_response(self, response: str) -> tuple[list[str], str] | None:
+        return parse_fused_flash_gpe_response(response)
+
+
+@register("fused_flash_gpe_markdown")
+class FusedFlashGPEMarkdownRewardModelProcessor(FusedFlashGPERewardModelProcessor):
+    """Use the Markdown output protocol with the shared fused Flash GPE scorer."""
+
+    def _parse_response(self, response: str) -> tuple[list[str], str] | None:
+        return parse_fused_flash_gpe_markdown_response(response)

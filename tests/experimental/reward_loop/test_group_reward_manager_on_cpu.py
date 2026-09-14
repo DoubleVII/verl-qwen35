@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import Sequence
 
 import numpy as np
@@ -10,6 +11,7 @@ from tensordict import TensorDict
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.group import (
     FusedFlashGPEMarkdownRewardModelProcessor,
+    FusedFlashGPERewardModelProcessor,
     GroupRewardManager,
 )
 from verl.utils.reward_score.group import myers_insert_delete_distance
@@ -49,6 +51,16 @@ class FakeFusedManager(FusedFlashGPEMarkdownRewardModelProcessor):
         return "analysis\nA: 2, B: 8"
 
 
+class FakeJSONFusedManager(FusedFlashGPERewardModelProcessor):
+    def __init__(self, *args, **kwargs):
+        self.prompts = []
+        super().__init__(*args, **kwargs)
+
+    async def _request(self, prompt):
+        self.prompts.append(prompt)
+        return "analysis\nA: 2, B: 8"
+
+
 def _batch():
     td = TensorDict(
         {
@@ -67,6 +79,14 @@ def _fused_markdown(candidates: Sequence[str], final_translation="final translat
     return (
         f"<thinking>generate</thinking><response>{rendered}</response>"
         f"<thinking>edit</thinking><response># Final Translation\n{final_translation}</response>"
+    )
+
+
+def _fused_json(candidates: Sequence[str], final_translation="final translation"):
+    rendered = json.dumps({"translations": candidates}, ensure_ascii=False)
+    return (
+        f"<thinking>generate</thinking><response>{rendered}</response>"
+        f"<thinking>edit</thinking><response>```text\n{final_translation}\n```</response>"
     )
 
 
@@ -149,6 +169,135 @@ def test_fused_markdown_manager_scores_only_final_translations():
     assert "final one" in manager.prompts[0]
     assert "final two" in manager.prompts[0]
     assert "# Candidate" not in manager.prompts[0]
+
+
+@pytest.mark.parametrize(
+    ("prompt_type", "max_candidates", "candidate_count"),
+    [("fixed_4", 4, 4), ("fixed_16", 16, 16), ("adaptive", 8, 2)],
+)
+def test_fused_json_manager_scores_only_final_translations(prompt_type, max_candidates, candidate_count):
+    responses = [
+        _fused_json([f"candidate {i}" for i in range(candidate_count)], "final one"),
+        _fused_json([f"alternative {i}" for i in range(candidate_count)], "final two"),
+    ]
+    infos = [
+        {
+            "src_text": "source",
+            "lang_pair": "en-zh",
+            "prompt_type": prompt_type,
+            "max_candidates": max_candidates,
+        }
+    ] * 2
+    manager = FakeJSONFusedManager(_fused_config(), FakeTokenizer(responses), reward_router_address="router")
+
+    result = asyncio.run(manager.run_batch(_fused_batch(responses, infos)))
+
+    assert [item["reward_score"] for item in result] == pytest.approx([0.2, 0.8])
+    assert len(manager.prompts) == 1
+    assert "final one" in manager.prompts[0]
+    assert "final two" in manager.prompts[0]
+    assert "candidate 0" not in manager.prompts[0]
+
+
+def test_fused_json_manager_honors_target_candidate_count():
+    responses = [
+        _fused_json(["one", "two", "three"], "final one"),
+        _fused_json(["four", "five", "six"], "final two"),
+    ]
+    infos = [
+        {
+            "src_text": "source",
+            "lang_pair": "en-zh",
+            "prompt_type": "adaptive",
+            "max_candidates": 8,
+            "target_candidate_count": 3,
+        }
+    ] * 2
+    manager = FakeJSONFusedManager(_fused_config(), FakeTokenizer(responses), reward_router_address="router")
+
+    result = asyncio.run(manager.run_batch(_fused_batch(responses, infos)))
+
+    assert [item["reward_score"] for item in result] == pytest.approx([0.2, 0.8])
+
+
+@pytest.mark.parametrize(
+    ("prompt_type", "max_candidates", "candidate_count"),
+    [
+        ("fixed_4", 4, 3),
+        ("fixed_4", 8, 4),
+        ("fixed_16", 16, 15),
+        ("adaptive", 8, 1),
+        ("adaptive", 2, 3),
+        ("unknown", 4, 4),
+    ],
+)
+def test_fused_json_manager_rejects_invalid_candidate_counts(prompt_type, max_candidates, candidate_count):
+    responses = [
+        _fused_json([f"candidate {i}" for i in range(candidate_count)], "final one"),
+        _fused_json([f"alternative {i}" for i in range(candidate_count)], "final two"),
+    ]
+    infos = [
+        {
+            "src_text": "source",
+            "lang_pair": "en-zh",
+            "prompt_type": prompt_type,
+            "max_candidates": max_candidates,
+        }
+    ] * 2
+    manager = FakeJSONFusedManager(_fused_config(), FakeTokenizer(responses), reward_router_address="router")
+
+    result = asyncio.run(manager.run_batch(_fused_batch(responses, infos)))
+
+    assert [item["reward_score"] for item in result] == [-1.0, -1.0]
+    assert manager.prompts == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "<thinking>incomplete</thinking>",
+        _fused_json(["one", "two"]).replace('"translations"', '"candidates"'),
+        _fused_json(["one", ""]),
+        _fused_json(["one", "two"]).replace("```text\nfinal translation\n```", "final translation"),
+    ],
+)
+def test_fused_json_manager_rejects_malformed_responses(response):
+    info = {
+        "src_text": "source",
+        "lang_pair": "en-zh",
+        "prompt_type": "adaptive",
+        "max_candidates": 4,
+    }
+    manager = FakeJSONFusedManager(_fused_config(), FakeTokenizer([response]), reward_router_address="router")
+
+    result = asyncio.run(manager.run_batch(_fused_batch([response], [info])))
+
+    assert result[0]["reward_score"] == -1.0
+    assert manager.prompts == []
+
+
+def test_fused_json_manager_applies_exact_match_diversity_penalty():
+    responses = [
+        _fused_json(["Same  Translation", " same translation "], "final one"),
+        _fused_json(["different one", "different two"], "final two"),
+    ]
+    infos = [
+        {
+            "src_text": "source",
+            "lang_pair": "en-zh",
+            "prompt_type": "adaptive",
+            "max_candidates": 2,
+        }
+    ] * 2
+    manager = FakeJSONFusedManager(
+        _fused_config(diversity_algorithm="exact_match", diversity_penalty_weight=1.0),
+        FakeTokenizer(responses),
+        reward_router_address="router",
+    )
+
+    result = asyncio.run(manager.run_batch(_fused_batch(responses, infos)))
+
+    assert [item["reward_score"] for item in result] == pytest.approx([-0.8, 0.8])
 
 
 def test_fused_markdown_manager_rejects_malformed_and_wrong_candidate_counts():
