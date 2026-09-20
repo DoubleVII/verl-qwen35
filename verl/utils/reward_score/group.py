@@ -42,6 +42,9 @@ _FUSED_FLASH_GPE_PATTERN = re.compile(
     rf"{re.escape(_FUSED_RESPONSE_CLOSE)}\s*",
     re.DOTALL,
 )
+_FUSED_SIMPLE_SEPARATOR = "---"
+_FUSED_SIMPLE_CONNECTOR = "Now, review the candidates and produce the best final translation."
+_FUSED_SIMPLE_ANALYSIS_HEADING = "# Step-by-step Analysis"
 
 
 def normalize_fused_candidate(text: str) -> str:
@@ -110,19 +113,8 @@ def parse_fused_flash_gpe_markdown_response(text: str | None) -> tuple[list[str]
         return None
     candidate_response, post_edit_response = sections
 
-    matches = list(re.finditer(r"(?m)^# Candidate ([1-9][0-9]*)[ \t]*$", candidate_response))
-    if not matches:
-        return None
-    candidates = []
-    for index, candidate_match in enumerate(matches):
-        if int(candidate_match.group(1)) != index + 1:
-            return None
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(candidate_response)
-        candidate = candidate_response[candidate_match.end() : end].strip()
-        if not candidate or "```" in candidate:
-            return None
-        candidates.append(candidate)
-    if len({normalize_fused_candidate(candidate) for candidate in candidates}) != len(candidates):
+    candidates = _extract_fused_markdown_candidates(candidate_response)
+    if candidates is None:
         return None
 
     marker = "# Final Translation"
@@ -134,6 +126,78 @@ def parse_fused_flash_gpe_markdown_response(text: str | None) -> tuple[list[str]
     else:
         final_translation = extract_response(post_edit_response, "codeblock")
     if not final_translation:
+        return None
+    return candidates, final_translation
+
+
+def _extract_fused_markdown_candidates(response: str) -> list[str] | None:
+    matches = list(re.finditer(r"(?m)^# Candidate ([1-9][0-9]*)[ \t]*$", response))
+    if not matches:
+        return None
+    candidates = []
+    for index, candidate_match in enumerate(matches):
+        if int(candidate_match.group(1)) != index + 1:
+            return None
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(response)
+        candidate = response[candidate_match.end() : end].strip()
+        if not candidate or "```" in candidate:
+            return None
+        candidates.append(candidate)
+    if len({normalize_fused_candidate(candidate) for candidate in candidates}) != len(candidates):
+        return None
+    return candidates
+
+
+def _split_fused_simple_analysis_section(text: str, body_pattern: str) -> tuple[str, str] | None:
+    text = text.strip()
+    analysis_match = re.match(rf"^{re.escape(_FUSED_SIMPLE_ANALYSIS_HEADING)}[ \t]*\n", text)
+    if analysis_match is None:
+        return None
+    body_match = re.search(body_pattern, text, re.MULTILINE)
+    if body_match is None:
+        return None
+    analysis = text[analysis_match.end() : body_match.start()].strip()
+    response = text[body_match.start() :].strip()
+    if not analysis or not response:
+        return None
+    return analysis, response
+
+
+def parse_fused_flash_gpe_simple_markdown_response(text: str | None) -> tuple[list[str], str] | None:
+    """Parse the visible-analysis simple Markdown Fused FlashGPE protocol."""
+    if not isinstance(text, str):
+        return None
+    text = text.replace("\r\n", "\n")
+    connector_matches = list(
+        re.finditer(
+            rf"(?m)^[ \t]*{re.escape(_FUSED_SIMPLE_SEPARATOR)}[ \t]*\n{{2,}}"
+            rf"[ \t]*{re.escape(_FUSED_SIMPLE_CONNECTOR)}[ \t]*$",
+            text,
+        )
+    )
+    if len(connector_matches) != 1:
+        return None
+
+    connector_match = connector_matches[0]
+    candidate_stage = text[: connector_match.start()]
+    post_edit_stage = text[connector_match.end() :]
+    if not candidate_stage.endswith("\n\n") or not post_edit_stage.startswith("\n\n"):
+        return None
+    candidate_sections = _split_fused_simple_analysis_section(candidate_stage, r"^# Candidate 1[ \t]*$")
+    post_edit_sections = _split_fused_simple_analysis_section(post_edit_stage, r"^# Final Translation[ \t]*$")
+    if candidate_sections is None or post_edit_sections is None:
+        return None
+
+    _, candidate_response = candidate_sections
+    _, post_edit_response = post_edit_sections
+    candidates = _extract_fused_markdown_candidates(candidate_response)
+    if candidates is None or post_edit_response.count("# Final Translation") != 1:
+        return None
+    final_section = post_edit_response[len("# Final Translation") :].strip()
+    if not final_section.startswith("```"):
+        return None
+    final_translation = extract_response(final_section, "codeblock")
+    if not final_translation or final_translation.startswith("# ") or "```" in final_translation:
         return None
     return candidates, final_translation
 
@@ -239,12 +303,12 @@ def is_language_match(text: str, target_lang: str) -> bool:
 
 def extract_response(text: str, kind: str) -> str | None:
     text = (text or "").strip()
-    if not text:
-        return None
     if kind == "none":
         return text
+    if not text:
+        return None
     if kind == "line":
-        return text.splitlines()[-1].strip() or None
+        return text.split("\n")[-1].strip() or None
     if kind == "oneline":
         return text if "\n" not in text else None
     if kind == "codeblock":
@@ -253,6 +317,12 @@ def extract_response(text: str, kind: str) -> str | None:
         block = text[:-3]
         block = block[block.rfind("```") + 3 :]
         return block.split("\n", 1)[-1].strip() or None
+    if kind == "markdown":
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() == "# Final Translation":
+                return "\n".join(lines[index + 1 :]).strip() or None
+        return None
     raise ValueError(f"Unknown extractor_type: {kind}")
 
 
@@ -267,41 +337,69 @@ def language_pair(info: dict[str, Any]) -> tuple[str, str]:
 
 
 def build_prompt(info: dict[str, Any], candidates: list[str], prompt_type: str, add_example: bool) -> str:
+    """Render the original GQM prompt, including whitespace and optional context."""
+    if len(candidates) == 1 or len(candidates) > len(IDENTIFIERS):
+        raise ValueError(f"GQM requires multiple candidates, up to {len(IDENTIFIERS)}")
     src, tgt = language_pair(info)
     src, tgt = LANG_MAP.get(src, src), LANG_MAP.get(tgt, tgt)
     task = {
-        "score": "score the candidates with integer scores on a scale from 0 to 10",
-        "ranking": "rank the candidates in order of quality from best to worst",
-        "ranking_score": "rank and score the candidates with integer scores on a scale from 0 to 10",
+        "score": "Finally, score the candidates with integer scores on a scale from 0 to 10.",
+        "ranking": "Finally, rank the candidates in order of quality from best to worst.",
+        "ranking_score": "Finally, rank and score the candidates with integer scores on a scale from 0 to 10.",
     }.get(prompt_type)
     if task is None:
         raise ValueError(f"Unsupported group_prompt_type: {prompt_type}")
-    example = " For example, use `B > A = C` and `B: 9, A: 7, C: 7`." if add_example else ""
-    body = "\n\n".join(f"Translation {IDENTIFIERS[i]}:\n```\n{text}\n```" for i, text in enumerate(candidates))
+    if add_example:
+        example = {
+            "score": "Output the scores on the last line, for example: `A: 4, B: 9, C: 7, D: 9`.",
+            "ranking": "Output the rankings in descending order on the last line, for example: `B > A = D > C`.",
+            "ranking_score": (
+                "At the end section, first output the rankings in descending order, for example: `B > A = D > C`. "
+                "Then, on the last line, output the scores, for example: `B: 9, A: 7, D: 7, C: 2`."
+            ),
+        }[prompt_type]
+        task += f" {example}"
+    body = "".join(f"Translation {IDENTIFIERS[i]}:\n```\n{text}\n```\n" for i, text in enumerate(candidates))
     extra = ""
-    if info.get("notes"):
-        extra += f"\n\nNotes:\n```\n{str(info['notes']).strip()}\n```"
-    if info.get("ref_text") and info.get("ref_lang"):
-        extra += f"\n\n{LANG_MAP.get(str(info['ref_lang']), info['ref_lang'])} reference:\n```\n{info['ref_text']}\n```"
+    ref_text, ref_lang = (info.get("ref_text") or "").strip(), (info.get("ref_lang") or "").strip()
+    if ref_text and ref_lang:
+        extra += (
+            "\n\nYou may refer to the following reference, if helpful, when evaluating the translations.\n\n"
+            f"{LANG_MAP.get(ref_lang, ref_lang)} reference:\n```\n{ref_text}\n```\n"
+        )
+    notes = (info.get("notes") or "").strip()
+    if notes:
+        extra += (
+            "\n\nYou may refer to the following notes, if helpful, when evaluating the translations.\n\n"
+            f"Notes:\n```\n{notes}\n```\n"
+        )
     return (
         f"Given a source text in {src} and multiple translation candidates in {tgt}. "
-        f"Perform a step by step analysis and comparison of translation quality, then finally {task}.{example}\n\n"
+        f"Perform a step by step analysis and comparison of the translation quality for the candidates. {task}\n\n"
         f"Source text:\n```\n{info['src_text']}\n```\n\n{body}{extra}"
     )
 
 
 def parse_scores(text: str, prompt_type: str, count: int) -> list[int] | None:
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    if not lines:
+    """Match the original GQM last-line parser and ranking score scale."""
+    text = (text or "").strip()
+    if not text:
         return None
-    score_line = lines[-1]
+    score_line = text.split("\n")[-1].strip()
     if prompt_type == "ranking":
-        ranking = score_line.split(">")
-        if sum(len(t.split("=")) for t in ranking) != count:
+        if "<" in score_line:
             return None
-        mapped = {name.strip(): count - i for i, tier in enumerate(ranking) for name in tier.split("=")}
+        ranking = score_line.split(">")
+        if sum(len({name.strip() for name in tier.split("=")}) for tier in ranking) != count:
+            return None
+        if any(score_line.count(name) != 1 for name in IDENTIFIERS[:count]):
+            return None
+        # Legacy ranking rewards are tier-based: the worst tier gets zero.
+        mapped = {name.strip(): len(ranking) - 1 - i for i, tier in enumerate(ranking) for name in tier.split("=")}
         return (
-            [mapped.get(IDENTIFIERS[i], -1) for i in range(count)] if set(mapped) == set(IDENTIFIERS[:count]) else None
+            [mapped[name] for name in IDENTIFIERS[:count]]
+            if all(name in mapped for name in IDENTIFIERS[:count])
+            else None
         )
 
     if prompt_type == "score":
@@ -314,9 +412,8 @@ def parse_scores(text: str, prompt_type: str, count: int) -> list[int] | None:
     if prompt_type != "ranking_score":
         return None
 
-    # Keep this parser in lockstep with examples/rewards/ranking_score_reward.py:
-    # GQM uses the final non-empty line as the score line and does not require
-    # the preceding analysis/ranking text to have a particular shape.
+    # Legacy GQM requires the expected identifiers but tolerates extra identifiers;
+    # duplicate identifiers take their last value. Do not tighten this during migration.
     try:
         scores = {}
         for item in score_line.strip().split(","):
@@ -324,7 +421,7 @@ def parse_scores(text: str, prompt_type: str, count: int) -> list[int] | None:
             scores[candidate_identifier.strip()] = int(score.strip())
     except (AttributeError, TypeError, ValueError):
         return None
-    if len(scores) != count or set(scores) != set(IDENTIFIERS[:count]):
+    if not all(name in scores for name in IDENTIFIERS[:count]):
         return None
     return [scores[IDENTIFIERS[i]] for i in range(count)]
 

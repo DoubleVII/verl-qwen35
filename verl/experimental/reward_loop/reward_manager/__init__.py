@@ -18,7 +18,12 @@ from .gdpo import GDPORewardManager
 from .naive import NaiveRewardManager
 from .limited import RateLimitedRewardManager
 from .remote import RemoteRewardManager
-from .group import FusedFlashGPEMarkdownRewardModelProcessor, FusedFlashGPERewardModelProcessor, GroupRewardManager
+from .group import (
+    FusedFlashGPEMarkdownRewardModelProcessor,
+    FusedFlashGPERewardModelProcessor,
+    FusedFlashGPESimpleMarkdownRewardModelProcessor,
+    GroupRewardManager,
+)
 
 __all__ = [
     "DAPORewardManager",
@@ -29,6 +34,7 @@ __all__ = [
     "GroupRewardManager",
     "FusedFlashGPERewardModelProcessor",
     "FusedFlashGPEMarkdownRewardModelProcessor",
+    "FusedFlashGPESimpleMarkdownRewardModelProcessor",
     "register",
     "get_reward_manager_cls",
 ]

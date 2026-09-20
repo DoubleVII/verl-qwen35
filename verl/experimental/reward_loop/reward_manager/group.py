@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import aiohttp
-import numpy as np
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
@@ -16,6 +15,7 @@ from verl.utils.reward_score.group import (
     overlong_penalty,
     parse_fused_flash_gpe_markdown_response,
     parse_fused_flash_gpe_response,
+    parse_fused_flash_gpe_simple_markdown_response,
     parse_scores,
     token_myers_diversity,
 )
@@ -43,38 +43,56 @@ class GroupRewardManager(RewardManagerBase):
         self.model = config.reward.reward_model.model_path
         rollout_cfg = config.reward.reward_model.get("rollout", {})
         self.max_tokens = int(rollout_cfg.get("response_length") or 2048)
+        self.sampling_params = {
+            "temperature": rollout_cfg.get("temperature", 1.0),
+            "top_p": rollout_cfg.get("top_p", 1.0),
+            "top_k": rollout_cfg.get("top_k", -1),
+        }
 
     def _prepare_response(self, response: str, info: dict) -> tuple[str | None, float]:
         return extract_response(response, self.extractor), 0.0
 
+    def _encode_prompt(self, prompt: str) -> list[int]:
+        """Use the same local chat template for length filtering and RM inference."""
+        text = self.rm_tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
+        )
+        return self.rm_tokenizer.encode(text, add_special_tokens=False)
+
     async def _request(self, prompt: str) -> str:
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            # The old processor sent templated token IDs directly to vLLM. Avoid
+            # server-side chat templating/reasoning extraction changing that contract.
+            "prompt": self._encode_prompt(prompt),
             "max_tokens": self.max_tokens,
+            **self.sampling_params,
         }
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
-            async with session.post(f"http://{self.router}/v1/chat/completions", json=payload) as response:
+            async with session.post(f"http://{self.router}/v1/completions", json=payload) as response:
                 response.raise_for_status()
                 response_json = await response.json()
                 choice = response_json["choices"][0]
-                result = choice["message"]["content"]
+                result = choice["text"]
                 return result
 
     async def run_batch(self, data: DataProto) -> list[dict]:
         n = len(data)
         responses = []
         response_penalties = []
-        infos = list(data.non_tensor_batch.get("extra_info", [{}] * n))
+        lengths = []
+        infos = list(data.non_tensor_batch["extra_info"])
         for i in range(n):
             ids = data.batch["responses"][i]
             length = int(data.batch["attention_mask"][i][-ids.shape[-1] :].sum())
-            response, penalty = self._prepare_response(
-                self.tokenizer.decode(ids[:length], skip_special_tokens=True), infos[i]
-            )
+            lengths.append(length)
+            text = self.tokenizer.decode(ids[:length], skip_special_tokens=True)
+            if self.tokenizer.eos_token:
+                text = text.replace(self.tokenizer.eos_token, "")
+            response, penalty = self._prepare_response(text, infos[i])
             responses.append(response)
             response_penalties.append(penalty)
-        uids = list(data.non_tensor_batch.get("uid", np.arange(n)))
+        uids = list(data.non_tensor_batch["uid"])
         groups = {}
         for i, uid in enumerate(uids):
             groups.setdefault(str(uid), []).append(i)
@@ -83,31 +101,38 @@ class GroupRewardManager(RewardManagerBase):
         for indices in groups.values():
             valid = []
             seen = {}
+            target_lang = language_pair(infos[indices[0]])[1]
             for i in indices:
                 text = responses[i]
-                target_lang = language_pair(infos[i])[1] if text is not None else ""
+                if text is None:
+                    continue
                 language_ok = not self.enable_language_detection or is_language_match(text, target_lang)
-                if text is not None and language_ok and text not in seen:
-                    seen[text] = len(valid)
+                if not language_ok:
+                    continue
+                if text not in seen:
+                    seen[text] = []
                     valid.append(text)
+                seen[text].append(i)
             if len(valid) <= 1:
                 continue
             prompt = build_prompt(infos[indices[0]], valid, self.prompt_type, self.add_example)
-            if len(self.rm_tokenizer.encode(prompt, add_special_tokens=False)) > self.max_prompt_length:
+            if len(self._encode_prompt(prompt)) > self.max_prompt_length:
                 continue
-            try:
-                output = await self._request(prompt)
-            except Exception:
-                output = ""
+            # Transport/server failures should fail the step as in the old engine,
+            # not silently turn an entire batch into negative training rewards.
+            output = await self._request(prompt)
             parsed = parse_scores(output, self.prompt_type, len(valid))
             if parsed is None:
-                continue
-            for i in indices:
-                if responses[i] in seen:
-                    score = parsed[seen[responses[i]]] * self.scale
-                    ids = data.batch["responses"][i]
-                    length = int(data.batch["attention_mask"][i][-ids.shape[-1] :].sum())
-                    scores[i] = score - overlong_penalty(length, self.overlong) - response_penalties[i]
+                # Compatibility with compute_group_translation_scores: only RM
+                # parse failures are scaled again; rejected inputs keep default.
+                parsed = [self.default] * len(valid)
+            for text, raw_score in zip(valid, parsed, strict=True):
+                targets = seen[text]
+                # Legacy GQM deduplicates translations before scoring and shares
+                # the first occurrence's length penalty across duplicate outputs.
+                score = raw_score * self.scale - overlong_penalty(lengths[targets[0]], self.overlong)
+                for i in targets:
+                    scores[i] = score - response_penalties[i]
                     metadata[i] = {"group_reward_output": output, "group_reward_prompt": prompt}
         return [{"reward_score": score, "reward_extra_info": metadata[i]} for i, score in enumerate(scores)]
 
@@ -175,3 +200,11 @@ class FusedFlashGPEMarkdownRewardModelProcessor(FusedFlashGPERewardModelProcesso
 
     def _parse_response(self, response: str) -> tuple[list[str], str] | None:
         return parse_fused_flash_gpe_markdown_response(response)
+
+
+@register("fused_flash_gpe_simple_markdown")
+class FusedFlashGPESimpleMarkdownRewardModelProcessor(FusedFlashGPERewardModelProcessor):
+    """Use the visible-analysis simple Markdown protocol with the shared scorer."""
+
+    def _parse_response(self, response: str) -> tuple[list[str], str] | None:
+        return parse_fused_flash_gpe_simple_markdown_response(response)
